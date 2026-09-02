@@ -51,8 +51,10 @@ export function LiveInterview({
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [fraudFlags, setFraudFlags] = useState<FraudFlag[]>([]);
 
-  // Dev Debug Panel
+  // Dev Debug Panel & Telemetry
   const [showDebug, setShowDebug] = useState(false);
+  const [activeProvider, setActiveProvider] = useState<'groq' | 'gemini' | 'static_fallback'>('groq');
+  const [lastApiError, setLastApiError] = useState<string | null>(null);
 
   // Soft Overall Session Timer (Total session duration, e.g. 15 mins)
   const [totalSecondsLeft, setTotalSecondsLeft] = useState(interview.duration_minutes * 60);
@@ -369,6 +371,9 @@ export function LiveInterview({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to generate conversational turn');
 
+      if (data.provider) setActiveProvider(data.provider);
+      setLastApiError(data.errorDetails || null);
+
       const nextMsg = data.nextMessage || "Let's explore your technical approach further.";
       const nextPhase: SessionPhase = data.phase || currentPhase;
       const isMoveOn = Boolean(data.moveOn);
@@ -395,6 +400,14 @@ export function LiveInterview({
 
       setLoadingTurn(false);
 
+      // If static fallback occurred, automatically retry the real LLM call again in the background after 3s
+      if (data.provider === 'static_fallback') {
+        console.warn('[Static Fallback Triggered] Auto-retrying real LLM turn in background in 3s...');
+        setTimeout(() => {
+          fetchTurn(updatedTranscript);
+        }, 3000);
+      }
+
       // Speak AI response and enable listening upon completion
       speakAiMessage(nextMsg, () => {
         if (nextPhase === 'close') {
@@ -403,11 +416,20 @@ export function LiveInterview({
           startListening();
         }
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error in fetchTurn:', err);
       setLoadingTurn(false);
-      const fallbackMsg = "Could you walk me through your engineering perspective on that?";
+      setActiveProvider('static_fallback');
+      setLastApiError(err.message || 'Fetch turn network error');
+
+      const fallbackMsg = "I'm having a brief technical moment, one second...";
       setAiMessage(fallbackMsg);
+      
+      // Auto-retry in background after 3s
+      setTimeout(() => {
+        fetchTurn(updatedTranscript);
+      }, 3000);
+
       speakAiMessage(fallbackMsg, () => startListening());
     }
   };
@@ -685,11 +707,21 @@ export function LiveInterview({
             </button>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 text-[11px] font-mono text-slate-400">
+          <div className="grid grid-cols-4 gap-2 text-[11px] font-mono text-slate-400">
             <div>Phase: <span className="text-white">{currentPhase}</span></div>
             <div>Turns: <span className="text-white">{questionTurnCount} / {interview.num_questions}</span></div>
+            <div>Provider: <span className={activeProvider === 'groq' ? 'text-emerald-400 font-bold' : activeProvider === 'gemini' ? 'text-blue-400 font-bold' : 'text-rose-400 font-bold'}>{activeProvider.toUpperCase()}</span></div>
             <div>Entries: <span className="text-white">{transcript.length}</span></div>
           </div>
+
+          {lastApiError && (
+            <div className="p-2.5 rounded-xl bg-rose-950/80 border border-rose-500/40 text-rose-300 font-mono text-[10px] space-y-1">
+              <div className="font-bold text-rose-400 flex items-center gap-1">
+                <AlertTriangle className="h-3.5 w-3.5" /> API Error Telemetry (Caught in Dev):
+              </div>
+              <p className="break-all whitespace-pre-wrap">{lastApiError}</p>
+            </div>
+          )}
 
           <div className="max-h-36 overflow-y-auto space-y-1.5 text-[11px] font-mono bg-slate-950 p-3 rounded-xl border border-slate-800">
             {transcript.length === 0 ? (
