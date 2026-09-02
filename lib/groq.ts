@@ -1,11 +1,16 @@
 import Groq from 'groq-sdk';
+import { GoogleGenAI } from '@google/genai';
 import { TranscriptEntry, SessionPhase, Difficulty } from './types';
 
-const apiKey = process.env.GROQ_API_KEY || '';
+// Primary LLM Provider: Groq
+const groqApiKey = process.env.GROQ_API_KEY || '';
+export const groq = groqApiKey ? new Groq({ apiKey: groqApiKey }) : null;
+export const GROQ_MODEL_VERSATILE = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
-export const groq = apiKey ? new Groq({ apiKey }) : null;
-
-export const GROQ_MODEL_VERSATILE = 'llama-3.3-70b-versatile';
+// Secondary Fallback LLM Provider: Google Gemini
+const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+export const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+export const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
 export interface ConversationalTurnOutput {
   nextMessage: string;
@@ -15,6 +20,18 @@ export interface ConversationalTurnOutput {
   showImage?: boolean;
   imageUrl?: string;
   context_hint?: string;
+  provider?: 'groq' | 'gemini' | 'static_fallback';
+  errorDetails?: string;
+}
+
+export interface EvaluationOutput {
+  score: number;
+  max_score: number;
+  feedback: string;
+  strengths: string[];
+  areas_for_improvement: string[];
+  provider?: 'groq' | 'gemini' | 'static_fallback';
+  errorDetails?: string;
 }
 
 // Curated high quality work-appropriate stock images for mid-interview observational curveball
@@ -49,7 +66,23 @@ function calculateSimilarity(str1: string, str2: string): number {
 }
 
 /**
- * Generate Next Conversational Turn with Transcript Context & Deduplication
+ * Clean LLM JSON output string before parsing
+ */
+function cleanJsonResponse(text: string): string {
+  let cleaned = text.trim();
+  if (cleaned.startsWith('```json')) {
+    cleaned = cleaned.slice(7);
+  } else if (cleaned.startsWith('```')) {
+    cleaned = cleaned.slice(3);
+  }
+  if (cleaned.endsWith('```')) {
+    cleaned = cleaned.slice(0, -3);
+  }
+  return cleaned.trim();
+}
+
+/**
+ * Generate Next Conversational Turn with Primary (Groq) -> Fallback (Gemini) -> Static Last Resort
  */
 export async function generateConversationalTurn(params: {
   category: string;
@@ -78,65 +111,8 @@ export async function generateConversationalTurn(params: {
       phase: currentPhase,
       moveOn: false,
       rejectedAnswer: true,
-      context_hint: "Response was too brief. Require detailed elaboration."
-    };
-  }
-
-  if (!groq) {
-    // Offline / fallback phase-based conversational engine
-    if (currentPhase === 'greeting') {
-      return {
-        nextMessage: "Hey! Thanks for joining today — how are you feeling? Ready to get started?",
-        phase: 'smalltalk',
-        moveOn: false
-      };
-    }
-    if (currentPhase === 'smalltalk') {
-      return {
-        nextMessage: "Glad to hear! Before we jump into technical topics, a quick reminder: our session uses live camera and mic monitoring with zero media storage. Shall we begin?",
-        phase: 'briefing',
-        moveOn: true
-      };
-    }
-    if (currentPhase === 'briefing') {
-      return {
-        nextMessage: `Awesome. Let's dive right into ${category}. To start, could you walk me through a major challenge or architecture decision you led recently?`,
-        phase: 'questions',
-        moveOn: true,
-        context_hint: 'Looking for candidate project background & STAR structure.'
-      };
-    }
-    if (currentPhase === 'questions' && questionTurnCount >= 2 && !imageUrl) {
-      const selectedImg = getRandomStockImage();
-      return {
-        nextMessage: "Let's try something a little different! I've placed an image on your screen. Take a look and describe what you see, what's happening, and what you'd infer from it.",
-        phase: 'image_round',
-        moveOn: true,
-        showImage: true,
-        imageUrl: selectedImg,
-        context_hint: 'Observational analysis and communication round.'
-      };
-    }
-    if (currentPhase === 'image_round') {
-      return {
-        nextMessage: "Great observation! Now returning to our technical dialogue: how do you approach risk mitigation and monitoring when deploying critical updates?",
-        phase: 'questions',
-        moveOn: true,
-        showImage: false
-      };
-    }
-    if (questionTurnCount >= totalQuestions) {
-      return {
-        nextMessage: "That wraps up our key topics for today! Thank you so much for your time and thoughtful responses. We're finalizing your evaluation report now.",
-        phase: 'close',
-        moveOn: true
-      };
-    }
-
-    return {
-      nextMessage: `Got it, that's a solid approach. Building on what you said, how do you handle unexpected trade-offs or constraints in ${category}?`,
-      phase: 'questions',
-      moveOn: true
+      context_hint: "Response was too brief. Require detailed elaboration.",
+      provider: 'groq'
     };
   }
 
@@ -149,6 +125,7 @@ export async function generateConversationalTurn(params: {
 
   const systemPrompt = `You are AI Interviewer, Europe's sharp, warm, and highly objective talent evaluation agent.
 Domain Category: ${category}
+Difficulty Standard: ${difficulty.toUpperCase()}
 Session Phase: ${currentPhase}
 Questions Answered So Far: ${questionTurnCount} / ${totalQuestions}
 
@@ -163,7 +140,7 @@ Phase Rules:
 3. BRIEFING: Transition smoothly into the first domain question for ${category}.
 4. QUESTIONS:
    - Ask deep follow-up questions if candidate's response needs clarification.
-   - ${isHardMode ? 'HARD MODE: Challenge assumptions, demand concrete metrics and architectural trade-offs.' : 'Focus on STAR structure and practical experience.'}
+   - ${isHardMode ? 'HARD MODE: Challenge assumptions ruthlessly, demand concrete performance metrics, exact scaling strategies, and architectural trade-offs.' : 'Focus on STAR structure, practical experience, and sound decision making.'}
    - If candidate answered sufficiently, set moveOn = true and ask the next core question in ${category}.
 5. IMAGE_ROUND: If questionTurnCount reaches 2 or 3 and image_round hasn't happened yet, transition casually ("Let's do something a little different...") and present a visual curveball.
 6. CLOSE: Wrap up warmly when questions are complete.
@@ -180,88 +157,157 @@ Return ONLY valid JSON matching this schema:
   "context_hint": "<1-line hint for evaluator guidance>"
 }`;
 
-  try {
-    const response = await groq.chat.completions.create({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `Current Transcript:\n${formattedTranscript || '(Beginning of interview session)'}` }
-      ],
-      model: GROQ_MODEL_VERSATILE,
-      response_format: { type: 'json_object' },
-      temperature: isHardMode ? 0.6 : 0.7,
-      max_tokens: 350
-    });
+  let groqErrorDetails: string | undefined;
 
-    const content = response.choices[0]?.message?.content || '{}';
-    const parsed = JSON.parse(content);
+  // -------------------------------------------------------------
+  // ATTEMPT 1: Primary LLM Provider — Groq
+  // -------------------------------------------------------------
+  if (groq) {
+    try {
+      const response = await groq.chat.completions.create({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Current Transcript:\n${formattedTranscript || '(Beginning of interview session)'}` }
+        ],
+        model: GROQ_MODEL_VERSATILE,
+        response_format: { type: 'json_object' },
+        temperature: isHardMode ? 0.6 : 0.7,
+        max_tokens: 800
+      });
 
-    let nextMsg = parsed.nextMessage || `Let's discuss your practical experience in ${category}. Could you walk me through a major project you led?`;
-    let nextPhase: SessionPhase = parsed.phase || currentPhase;
-    let moveOn: boolean = Boolean(parsed.moveOn);
-    let showImg: boolean = Boolean(parsed.showImage);
+      const content = response.choices[0]?.message?.content || '{}';
+      const parsed = JSON.parse(cleanJsonResponse(content));
 
-    // Defensive Deduplication Check
-    const previousAiLines = transcript.filter((t) => t.role === 'ai').map((t) => t.text);
-    for (const prevLine of previousAiLines) {
-      const similarity = calculateSimilarity(nextMsg, prevLine);
-      if (similarity > 0.7) {
-        console.warn(`[AI Deduplication] High similarity detected (${(similarity * 100).toFixed(1)}%). Forcing fresh topic generation.`);
-        moveOn = true;
-        nextMsg = `Building on that perspective, how do you approach performance monitoring and scaling under heavy load in ${category}?`;
-        break;
+      let nextMsg = parsed.nextMessage || `Let's discuss your practical experience in ${category}. Could you walk me through a major project you led?`;
+      let nextPhase: SessionPhase = parsed.phase || currentPhase;
+      let moveOn: boolean = Boolean(parsed.moveOn);
+      let showImg: boolean = Boolean(parsed.showImage);
+
+      // Defensive Deduplication Check
+      const previousAiLines = transcript.filter((t) => t.role === 'ai').map((t) => t.text);
+      for (const prevLine of previousAiLines) {
+        const similarity = calculateSimilarity(nextMsg, prevLine);
+        if (similarity > 0.7) {
+          console.warn(`[AI Deduplication] High similarity detected (${(similarity * 100).toFixed(1)}%). Forcing fresh topic generation.`);
+          moveOn = true;
+          nextMsg = `Building on that perspective, how do you approach performance monitoring and scaling under heavy load in ${category}?`;
+          break;
+        }
       }
-    }
 
-    let imgUrl: string | undefined = undefined;
-    if (showImg || nextPhase === 'image_round') {
-      imgUrl = imageUrl || getRandomStockImage();
-      showImg = true;
-      nextPhase = 'image_round';
-    }
+      let imgUrl: string | undefined = undefined;
+      if (showImg || nextPhase === 'image_round') {
+        imgUrl = imageUrl || getRandomStockImage();
+        showImg = true;
+        nextPhase = 'image_round';
+      }
 
-    return {
-      nextMessage: nextMsg,
-      phase: nextPhase,
-      moveOn,
-      showImage: showImg,
-      imageUrl: imgUrl,
-      context_hint: parsed.context_hint || 'Evaluate domain depth and structure.'
-    };
-  } catch (error) {
-    console.error('Groq generateConversationalTurn error:', error);
-    return {
-      nextMessage: `Could you share a concrete scenario in ${category} where you had to make a high-stakes technical decision?`,
-      phase: currentPhase === 'greeting' || currentPhase === 'smalltalk' ? 'questions' : currentPhase,
-      moveOn: true
-    };
+      return {
+        nextMessage: nextMsg,
+        phase: nextPhase,
+        moveOn,
+        showImage: showImg,
+        imageUrl: imgUrl,
+        context_hint: parsed.context_hint || 'Evaluate domain depth and structure.',
+        provider: 'groq'
+      };
+    } catch (error: any) {
+      groqErrorDetails = `[Groq Model: ${GROQ_MODEL_VERSATILE}] ${error.status || error.name || 'Error'}: ${error.message || String(error)}`;
+      console.error('[Groq generateConversationalTurn failed]', groqErrorDetails);
+    }
+  } else {
+    groqErrorDetails = `[Groq] GROQ_API_KEY is missing or empty.`;
+    console.warn(groqErrorDetails);
   }
+
+  // -------------------------------------------------------------
+  // ATTEMPT 2: Secondary Fallback Provider — Google Gemini
+  // -------------------------------------------------------------
+  let geminiErrorDetails: string | undefined;
+  if (gemini) {
+    try {
+      console.warn('[Fallback] Retrying generateConversationalTurn via Gemini...');
+      const geminiRes = await gemini.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: `Current Transcript:\n${formattedTranscript || '(Beginning of interview session)'}`,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+          temperature: isHardMode ? 0.6 : 0.7,
+          maxOutputTokens: 800
+        }
+      });
+
+      const content = geminiRes.text || '{}';
+      const parsed = JSON.parse(cleanJsonResponse(content));
+
+      let nextMsg = parsed.nextMessage || `Let's discuss your practical experience in ${category}. Could you walk me through a major project you led?`;
+      let nextPhase: SessionPhase = parsed.phase || currentPhase;
+      let moveOn: boolean = Boolean(parsed.moveOn);
+      let showImg: boolean = Boolean(parsed.showImage);
+
+      // Defensive Deduplication Check
+      const previousAiLines = transcript.filter((t) => t.role === 'ai').map((t) => t.text);
+      for (const prevLine of previousAiLines) {
+        const similarity = calculateSimilarity(nextMsg, prevLine);
+        if (similarity > 0.7) {
+          console.warn(`[AI Deduplication] High similarity detected (${(similarity * 100).toFixed(1)}%). Forcing fresh topic generation.`);
+          moveOn = true;
+          nextMsg = `Building on that perspective, how do you approach performance monitoring and scaling under heavy load in ${category}?`;
+          break;
+        }
+      }
+
+      let imgUrl: string | undefined = undefined;
+      if (showImg || nextPhase === 'image_round') {
+        imgUrl = imageUrl || getRandomStockImage();
+        showImg = true;
+        nextPhase = 'image_round';
+      }
+
+      return {
+        nextMessage: nextMsg,
+        phase: nextPhase,
+        moveOn,
+        showImage: showImg,
+        imageUrl: imgUrl,
+        context_hint: parsed.context_hint || 'Evaluate domain depth and structure.',
+        provider: 'gemini',
+        errorDetails: groqErrorDetails
+      };
+    } catch (error: any) {
+      geminiErrorDetails = `[Gemini Model: ${GEMINI_MODEL}] ${error.status || error.name || 'Error'}: ${error.message || String(error)}`;
+      console.error('[Gemini generateConversationalTurn failed]', geminiErrorDetails);
+    }
+  } else {
+    geminiErrorDetails = `[Gemini] GEMINI_API_KEY is missing or empty.`;
+  }
+
+  // -------------------------------------------------------------
+  // ATTEMPT 3: Absolute Last Resort Static Fallback
+  // Generic message so candidate knows system is reconnecting, not a real question
+  // -------------------------------------------------------------
+  const combinedError = [groqErrorDetails, geminiErrorDetails].filter(Boolean).join(' | ');
+
+  return {
+    nextMessage: "I'm having a brief technical moment, one second...",
+    phase: currentPhase,
+    moveOn: false,
+    provider: 'static_fallback',
+    errorDetails: combinedError
+  };
 }
 
 /**
- * Evaluate Candidate Answer against Domain Rubric (Backend only)
+ * Evaluate Candidate Answer against Domain Rubric (Primary Groq -> Fallback Gemini -> Static)
  */
 export async function evaluateAnswer(params: {
   category: string;
   difficulty: Difficulty;
   question: string;
   answer: string;
-}) {
+}): Promise<EvaluationOutput> {
   const { category, difficulty, question, answer } = params;
-
-  if (!groq) {
-    const wordCount = answer ? answer.trim().split(/\s+/).length : 0;
-    let baseScore = Math.min(10, Math.max(3, Math.floor(wordCount / 10)));
-    if (difficulty === 'medium') baseScore = Math.max(1, baseScore - 1);
-    if (difficulty === 'hard') baseScore = Math.max(1, baseScore - 2);
-
-    return {
-      score: baseScore,
-      max_score: 10,
-      feedback: wordCount > 25 ? 'Structured response addressing core prompt.' : 'Response was brief. Focus on STAR method details.',
-      strengths: ['Addressed core topic'],
-      areas_for_improvement: ['Include quantifiable metrics']
-    };
-  }
 
   const systemPrompt = `You are AI Interviewer, Europe's objective corporate talent evaluation engine.
 Domain Category: ${category}
@@ -278,35 +324,150 @@ Output ONLY valid JSON:
   "areas_for_improvement": ["<area 1>", "<area 2>"]
 }`;
 
-  try {
-    const response = await groq.chat.completions.create({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: 'Evaluate response.' }
-      ],
-      model: GROQ_MODEL_VERSATILE,
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-      max_tokens: 300
-    });
+  let groqErrorDetails: string | undefined;
 
-    const content = response.choices[0]?.message?.content || '{}';
-    const parsed = JSON.parse(content);
-    return {
-      score: typeof parsed.score === 'number' ? parsed.score : 6,
-      max_score: 10,
-      feedback: parsed.feedback || 'Evaluated against category standards.',
-      strengths: Array.isArray(parsed.strengths) ? parsed.strengths : ['Clear domain communication'],
-      areas_for_improvement: Array.isArray(parsed.areas_for_improvement) ? parsed.areas_for_improvement : ['Include measurable outcomes']
-    };
-  } catch (error) {
-    console.error('Groq evaluateAnswer error:', error);
-    return {
-      score: 6,
-      max_score: 10,
-      feedback: 'Response evaluated against category standard.',
-      strengths: ['Direct response'],
-      areas_for_improvement: ['Elaborate further']
-    };
+  // -------------------------------------------------------------
+  // ATTEMPT 1: Groq Primary
+  // -------------------------------------------------------------
+  if (groq) {
+    try {
+      const response = await groq.chat.completions.create({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'Evaluate response.' }
+        ],
+        model: GROQ_MODEL_VERSATILE,
+        response_format: { type: 'json_object' },
+        temperature: 0.2,
+        max_tokens: 800
+      });
+
+      const content = response.choices[0]?.message?.content || '{}';
+      const parsed = JSON.parse(cleanJsonResponse(content));
+      return {
+        score: typeof parsed.score === 'number' ? parsed.score : 6,
+        max_score: 10,
+        feedback: parsed.feedback || 'Evaluated against category standards.',
+        strengths: Array.isArray(parsed.strengths) ? parsed.strengths : ['Clear domain communication'],
+        areas_for_improvement: Array.isArray(parsed.areas_for_improvement) ? parsed.areas_for_improvement : ['Include measurable outcomes'],
+        provider: 'groq'
+      };
+    } catch (error: any) {
+      groqErrorDetails = `[Groq Model: ${GROQ_MODEL_VERSATILE}] ${error.status || error.name || 'Error'}: ${error.message || String(error)}`;
+      console.error('[Groq evaluateAnswer failed]', groqErrorDetails);
+    }
+  } else {
+    groqErrorDetails = `[Groq] GROQ_API_KEY missing.`;
   }
+
+  // -------------------------------------------------------------
+  // ATTEMPT 2: Gemini Fallback
+  // -------------------------------------------------------------
+  let geminiErrorDetails: string | undefined;
+  if (gemini) {
+    try {
+      console.warn('[Fallback] Retrying evaluateAnswer via Gemini...');
+      const geminiRes = await gemini.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: 'Evaluate response.',
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+          maxOutputTokens: 800
+        }
+      });
+
+      const content = geminiRes.text || '{}';
+      const parsed = JSON.parse(cleanJsonResponse(content));
+      return {
+        score: typeof parsed.score === 'number' ? parsed.score : 6,
+        max_score: 10,
+        feedback: parsed.feedback || 'Evaluated against category standards.',
+        strengths: Array.isArray(parsed.strengths) ? parsed.strengths : ['Clear domain communication'],
+        areas_for_improvement: Array.isArray(parsed.areas_for_improvement) ? parsed.areas_for_improvement : ['Include measurable outcomes'],
+        provider: 'gemini',
+        errorDetails: groqErrorDetails
+      };
+    } catch (error: any) {
+      geminiErrorDetails = `[Gemini Model: ${GEMINI_MODEL}] ${error.status || error.name || 'Error'}: ${error.message || String(error)}`;
+      console.error('[Gemini evaluateAnswer failed]', geminiErrorDetails);
+    }
+  } else {
+    geminiErrorDetails = `[Gemini] GEMINI_API_KEY missing.`;
+  }
+
+  // -------------------------------------------------------------
+  // ATTEMPT 3: Static Fallback
+  // -------------------------------------------------------------
+  const wordCount = answer ? answer.trim().split(/\s+/).length : 0;
+  let baseScore = Math.min(10, Math.max(3, Math.floor(wordCount / 10)));
+  if (difficulty === 'medium') baseScore = Math.max(1, baseScore - 1);
+  if (difficulty === 'hard') baseScore = Math.max(1, baseScore - 2);
+
+  const combinedError = [groqErrorDetails, geminiErrorDetails].filter(Boolean).join(' | ');
+
+  return {
+    score: baseScore,
+    max_score: 10,
+    feedback: wordCount > 25 ? 'Structured response addressing core prompt.' : 'Response was brief. Focus on STAR method details.',
+    strengths: ['Addressed core topic'],
+    areas_for_improvement: ['Include quantifiable metrics'],
+    provider: 'static_fallback',
+    errorDetails: combinedError
+  };
+}
+
+/**
+ * Uptime / Health Check Helper for LLMs
+ */
+export async function checkLLMHealth(): Promise<{
+  status: 'ok' | 'degraded' | 'error';
+  groq: { ok: boolean; model: string; error?: string };
+  gemini: { ok: boolean; model: string; error?: string };
+}> {
+  let groqOk = false;
+  let groqError: string | undefined;
+
+  if (groq) {
+    try {
+      await groq.chat.completions.create({
+        messages: [{ role: 'user', content: 'Reply OK' }],
+        model: GROQ_MODEL_VERSATILE,
+        max_tokens: 5
+      });
+      groqOk = true;
+    } catch (err: any) {
+      groqError = `[Groq ${GROQ_MODEL_VERSATILE}] ${err.status || err.name || 'Error'}: ${err.message}`;
+      console.warn(`[SERVER HEALTH CHECK WARNING] Groq model "${GROQ_MODEL_VERSATILE}" failed health check:`, err.message);
+    }
+  } else {
+    groqError = 'GROQ_API_KEY is not configured';
+    console.warn('[SERVER HEALTH CHECK WARNING] GROQ_API_KEY is not set');
+  }
+
+  let geminiOk = false;
+  let geminiError: string | undefined;
+
+  if (gemini) {
+    try {
+      await gemini.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: 'Reply OK'
+      });
+      geminiOk = true;
+    } catch (err: any) {
+      geminiError = `[Gemini ${GEMINI_MODEL}] ${err.status || err.name || 'Error'}: ${err.message}`;
+      console.warn(`[SERVER HEALTH CHECK WARNING] Gemini model "${GEMINI_MODEL}" failed health check:`, err.message);
+    }
+  } else {
+    geminiError = 'GEMINI_API_KEY is not configured';
+  }
+
+  const status = groqOk ? 'ok' : geminiOk ? 'degraded' : 'error';
+  return {
+    status,
+    groq: { ok: groqOk, model: GROQ_MODEL_VERSATILE, error: groqError },
+    gemini: { ok: geminiOk, model: GEMINI_MODEL, error: geminiError }
+  };
 }
